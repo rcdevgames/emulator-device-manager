@@ -19,12 +19,12 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 800.0])
             .with_min_inner_size([880.0, 560.0])
-            .with_title("Device Manager")
+            .with_title("ManDra")
             .with_icon(window_icon()),
         ..Default::default()
     };
     eframe::run_native(
-        "devmgr",
+        "mandra",
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )

@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "emulator-panel"
-version = "0.1.0"
+version = "0.1.0-beta"
 dependencies = [
  "anyhow",
  "eframe",

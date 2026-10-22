@@ -1,8 +1,8 @@
 [package]
 name = "emulator-panel"
-version = "0.1.0"
+version = "0.1.0-beta"
 edition = "2021"
-description = "Single-binary Android device manager GUI: AVD lifecycle, adb devices, logcat, install, screenshot, port forward."
+description = "Management Android Emulator"
 
 [[bin]]
 name = "devmgr"

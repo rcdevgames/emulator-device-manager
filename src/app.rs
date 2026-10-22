@@ -52,6 +52,8 @@ struct CreateForm {
     device_id: String,
     image: String,
     sdcard: String,
+    device_frame: bool,
+    custom_frame: String,
     error: String,
 }
 
@@ -63,6 +65,8 @@ struct EditForm {
     height: String,
     density: String,
     gpu: String,
+    device_frame: bool,
+    custom_frame: String,
     sdcard: String,
     data: String,
 }
@@ -95,6 +99,8 @@ enum Act {
     Logcat,
     ClearLogcat,
     PickApk,
+    PickCreateFrame,
+    PickEditFrame,
     Install,
     AddForward,
     RemoveForward,
@@ -438,6 +444,8 @@ impl App {
                     device_id,
                     image,
                     sdcard: "512M".into(),
+                    device_frame: true,
+                    custom_frame: String::new(),
                     error: String::new(),
                 });
             }
@@ -526,6 +534,8 @@ impl App {
                         } else {
                             avd.gpu.clone()
                         },
+                        device_frame: avd.device_frame,
+                        custom_frame: avd.custom_frame.clone(),
                         sdcard: avd.sdcard.clone(),
                         data: avd.data_partition.clone(),
                         avd: avd.clone(),
@@ -541,6 +551,24 @@ impl App {
                 avd.set("hw.lcd.height", form.height.trim());
                 avd.set("hw.lcd.density", form.density.trim());
                 avd.set("hw.gpu.mode", form.gpu.trim());
+                avd.set("showDeviceFrame", if form.device_frame { "yes" } else { "no" });
+                if form.custom_frame.trim().is_empty() {
+                    avd.unset("skin.path");
+                } else {
+                    let frame = Path::new(form.custom_frame.trim());
+                    if !frame.is_file() && !frame.is_dir() {
+                        self.log(
+                            Level::Err,
+                            format!(
+                                "arsip atau folder custom frame tidak ditemukan: {}",
+                                frame.display()
+                            ),
+                        );
+                        self.edit = Some(form);
+                        return;
+                    }
+                    avd.set("skin.path", frame.to_string_lossy().as_ref());
+                }
                 if !form.sdcard.trim().is_empty() {
                     avd.set("hw.sdCard", "yes");
                     avd.set("sdcard.size", form.sdcard.trim());
@@ -622,6 +650,29 @@ impl App {
                     .pick_file()
                 {
                     self.apk = path.to_string_lossy().to_string();
+                }
+            }
+            Act::PickCreateFrame => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Pilih arsip custom device frame / skin")
+                    .add_filter("Android emulator skin", &["zip"])
+                    .pick_file()
+                {
+                    if let Some(form) = &mut self.create {
+                        form.custom_frame = path.to_string_lossy().to_string();
+                        form.error.clear();
+                    }
+                }
+            }
+            Act::PickEditFrame => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Pilih arsip custom device frame / skin")
+                    .add_filter("Android emulator skin", &["zip"])
+                    .pick_file()
+                {
+                    if let Some(form) = &mut self.edit {
+                        form.custom_frame = path.to_string_lossy().to_string();
+                    }
                 }
             }
             Act::Install => {
@@ -793,7 +844,7 @@ impl App {
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(5.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Device Manager").strong().size(17.0));
+                ui.label(RichText::new("ManDra").strong().size(17.0));
                 ui.label(
                     RichText::new(short_path(&self.sdk.root))
                         .color(MUTED)
@@ -1060,6 +1111,8 @@ impl App {
                         kv(ui, "RAM", &format!("{} MB", dash(&avd.ram)));
                         kv(ui, "CPU cores", &avd.cores);
                         kv(ui, "Screen", &avd.screen());
+                        kv(ui, "Device frame", if avd.device_frame { "yes" } else { "no" });
+                        kv(ui, "Custom frame", dash(&avd.custom_frame));
                         kv(ui, "SD card", &avd.sdcard);
                         kv(ui, "Data partition", &avd.data_partition);
                         kv(ui, "GPU mode", &avd.gpu);
@@ -1303,13 +1356,13 @@ impl App {
 
 impl App {
     fn modals(&mut self, ctx: &egui::Context, act: &mut Option<Act>) {
-        self.create_modal(ctx);
+        self.create_modal(ctx, act);
         self.edit_modal(ctx, act);
         self.delete_modal(ctx, act);
         self.settings_modal(ctx);
     }
 
-    fn create_modal(&mut self, ctx: &egui::Context) {
+    fn create_modal(&mut self, ctx: &egui::Context, act: &mut Option<Act>) {
         let Some(mut form) = self.create.take() else { return };
         let mut open = true;
         let mut submit = false;
@@ -1380,6 +1433,23 @@ impl App {
                         ui.label("SD card");
                         ui.add(egui::TextEdit::singleline(&mut form.sdcard).desired_width(120.0));
                         ui.end_row();
+
+                        ui.label("Device frame");
+                        ui.checkbox(&mut form.device_frame, "pakai frame perangkat");
+                        ui.end_row();
+
+                        ui.label("Custom frame / skin");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.custom_frame)
+                                    .hint_text("arsip .zip atau folder skin, opsional")
+                                    .desired_width(230.0),
+                            );
+                            if ui.button("Browse").clicked() {
+                                *act = Some(Act::PickCreateFrame);
+                            }
+                        });
+                        ui.end_row();
                     });
 
                 if self.images.is_empty() {
@@ -1423,6 +1493,14 @@ impl App {
             self.create = Some(form);
             return;
         }
+        if !form.custom_frame.trim().is_empty() {
+            let frame = Path::new(form.custom_frame.trim());
+            if !frame.is_file() && !frame.is_dir() {
+                form.error = "arsip atau folder custom frame tidak ditemukan".into();
+                self.create = Some(form);
+                return;
+            }
+        }
         if self.avds.iter().any(|a| a.name == name) {
             form.error = "nama AVD sudah dipakai".into();
             self.create = Some(form);
@@ -1433,6 +1511,8 @@ impl App {
             device_id: form.device_id.clone(),
             image_package: form.image.clone(),
             sdcard: form.sdcard.clone(),
+            device_frame: form.device_frame,
+            custom_frame: form.custom_frame.clone(),
         };
         let sdk = self.sdk.clone();
         self.busy += 1;
@@ -1510,6 +1590,23 @@ impl App {
                                     ui.selectable_value(&mut form.gpu, mode.to_string(), mode);
                                 }
                             });
+                        ui.end_row();
+
+                        ui.label("Device frame");
+                        ui.checkbox(&mut form.device_frame, "pakai frame perangkat");
+                        ui.end_row();
+
+                        ui.label("Custom frame / skin");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.custom_frame)
+                                    .hint_text("arsip .zip atau folder skin, opsional")
+                                    .desired_width(230.0),
+                            );
+                            if ui.button("Browse").clicked() {
+                                *act = Some(Act::PickEditFrame);
+                            }
+                        });
                         ui.end_row();
                     });
                 ui.add_space(10.0);

@@ -398,6 +398,8 @@ pub struct Avd {
     pub sdcard: String,
     pub data_partition: String,
     pub gpu: String,
+    pub device_frame: bool,
+    pub custom_frame: String,
     pub playstore: bool,
     /// Raw config.ini lines, so unknown keys survive a rewrite.
     pub lines: Vec<String>,
@@ -442,6 +444,10 @@ impl Avd {
         avd.sdcard = read("sdcard.size").unwrap_or_default();
         avd.data_partition = read("disk.dataPartition.size").unwrap_or_default();
         avd.gpu = read("hw.gpu.mode").unwrap_or_default();
+        avd.device_frame = read("showDeviceFrame")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"))
+            .unwrap_or(false);
+        avd.custom_frame = read("skin.path").unwrap_or_default();
         avd.playstore = read("PlayStore.enabled")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -470,6 +476,14 @@ impl Avd {
         if !found {
             self.lines.push(format!("{key}={value}"));
         }
+    }
+
+    pub fn unset(&mut self, key: &str) {
+        self.lines.retain(|line| {
+            line.split_once('=')
+                .map(|(k, _)| k.trim() != key)
+                .unwrap_or(true)
+        });
     }
 
     pub fn save(&self) -> Result<()> {
@@ -547,6 +561,8 @@ pub struct AvdDraft {
     pub device_id: String,
     pub image_package: String,
     pub sdcard: String,
+    pub device_frame: bool,
+    pub custom_frame: String,
 }
 
 pub fn list_avds(sdk: &Sdk) -> Vec<Avd> {
@@ -705,6 +721,28 @@ pub fn create_avd(sdk: &Sdk, draft: &AvdDraft) -> Result<String> {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     // avdmanager asks "Do you wish to create a custom hardware profile?" — decline.
     let out = proc::run_stdin(tool, &refs, "no\nno\n")?;
+
+    let mut avd = list_avds(sdk)
+        .into_iter()
+        .find(|avd| avd.name == draft.name)
+        .with_context(|| format!("load created AVD {}", draft.name))?;
+    avd.set(
+        "showDeviceFrame",
+        if draft.device_frame { "yes" } else { "no" },
+    );
+    if draft.custom_frame.trim().is_empty() {
+        avd.unset("skin.path");
+    } else {
+        let frame = Path::new(draft.custom_frame.trim());
+        if !frame.is_file() && !frame.is_dir() {
+            anyhow::bail!(
+                "arsip atau folder custom frame tidak ditemukan: {}",
+                frame.display()
+            );
+        }
+        avd.set("skin.path", frame.to_string_lossy().as_ref());
+    }
+    avd.save()?;
     Ok(out)
 }
 
@@ -871,6 +909,20 @@ mod tests {
         assert_eq!(avd.get("hw.ramSize").as_deref(), Some("2048"));
         assert_eq!(avd.api(), "36");
     }
+    #[test]
+    fn device_frame_defaults_to_disabled_when_key_is_missing() {
+        let base = std::env::temp_dir().join(format!("devmgr-frame-test-{}", std::process::id()));
+        let avd_dir = base.join("NoFrame.avd");
+        std::fs::create_dir_all(&avd_dir).unwrap();
+        std::fs::write(avd_dir.join("config.ini"), "AvdId=NoFrame\ntarget=android-36\n").unwrap();
+        let ini = base.join("NoFrame.ini");
+        std::fs::write(&ini, format!("path={}\n", avd_dir.display())).unwrap();
+
+        let avd = Avd::load(&ini).unwrap();
+        assert!(!avd.device_frame);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn set_replaces_in_place_and_appends() {
@@ -949,7 +1001,7 @@ mod tests {
         std::fs::create_dir_all(&avd_dir).unwrap();
         std::fs::write(
             avd_dir.join("config.ini"),
-            "AvdId=Hape\ntarget=android-36\nhw.ramSize=2048\n",
+            "AvdId=Hape\ntarget=android-36\nhw.ramSize=2048\nshowDeviceFrame=no\nskin.path=C:\\frames\\pixel\n",
         )
         .unwrap();
         let ini = base.join("Hape.ini");
@@ -964,6 +1016,8 @@ mod tests {
         assert_eq!(avd.dir, avd_dir);
         assert_eq!(avd.ram, "2048");
         assert_eq!(avd.api(), "36");
+        assert!(!avd.device_frame);
+        assert_eq!(avd.custom_frame, r"C:\frames\pixel");
 
         let _ = std::fs::remove_dir_all(&base);
     }

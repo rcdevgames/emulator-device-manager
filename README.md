@@ -1,4 +1,4 @@
-# devmgr — Android Device Manager (single binary)
+# ManDra, Management Android Emulator
 
 GUI pengganti jendela *Device Manager* di Android Studio. Satu file `.exe`, tanpa install,
 tanpa JVM sendiri: semua pekerjaan dilakukan lewat `emulator`, `adb`, dan `avdmanager`
@@ -32,8 +32,7 @@ $env:RUSTFLAGS = "-C link-arg=-L$((Resolve-Path .linkshim).Path)"
 
 | Area | Aksi |
 | --- | --- |
-| AVD | list, start, cold boot, wipe data, stop, delete, edit config (RAM/cores/resolusi/density/GPU/SD/data partition) |
-| AVD | buat baru dari system image yang sudah ter-download, pilih device profile |
+| AVD | list, start, cold boot, wipe data, stop, delete, edit config, tambah baru dengan device frame on/off dan custom skin (.zip atau folder) lewat Browse |
 | Device | daftar device fisik + emulator (`adb devices -l`), detail model/product/transport |
 | Screen | capture sekali atau live, simpan PNG ke `devmgr-out/` |
 | Logcat | tail dengan filter teks, jumlah baris, mode live, clear |
