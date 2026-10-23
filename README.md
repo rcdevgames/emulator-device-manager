@@ -34,7 +34,7 @@ $env:RUSTFLAGS = "-C link-arg=-L$((Resolve-Path .linkshim).Path)"
 | --- | --- |
 | AVD | list, start, cold boot, wipe data, stop, delete, edit config, tambah baru dengan device frame on/off dan custom skin (.zip atau folder) lewat Browse |
 | Device | daftar device fisik + emulator (`adb devices -l`), detail model/product/transport |
-| Screen | capture sekali atau live, simpan PNG ke `devmgr-out/` |
+| Screen | capture sekali atau live, simpan PNG ke `devmgr-out/`, dan rekam layar ke MP4 (`adb shell screenrecord`, maks. 3 menit) |
 | Logcat | tail dengan filter teks, jumlah baris, mode live, clear |
 | Install | `adb install` (opsional `-r`), pilih file atau drag & drop `.apk` ke jendela |
 | Ports | `adb forward` / `adb reverse`, add / remove / list |

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use crate::sdk::{Avd, Device, DeviceDef, SystemImage};
@@ -19,6 +20,19 @@ pub enum Msg {
     Images(Vec<SystemImage>),
     Defs(Vec<DeviceDef>),
     Screen(Vec<u8>),
+    RecordStarted {
+        serial: String,
+        remote_path: String,
+        pid: u32,
+    },
+    RecordStartFailed(String),
+    RecordStopped(PathBuf),
+    RecordStopFailed {
+        serial: String,
+        remote_path: String,
+        pid: u32,
+        error: String,
+    },
     Logcat(String),
     Forwards(String),
     Snapshots(String),

@@ -47,6 +47,23 @@ impl Tab {
     }
 }
 
+/// One recorder at a time; the serial is kept so a stop still works after the
+/// selection moves to another device.
+enum RecordingState {
+    Idle,
+    Starting {
+        serial: String,
+    },
+    Recording {
+        serial: String,
+        remote_path: String,
+        pid: u32,
+    },
+    Stopping {
+        serial: String,
+    },
+}
+
 struct CreateForm {
     name: String,
     device_id: String,
@@ -95,6 +112,8 @@ enum Act {
     SaveEdit,
     Reveal(PathBuf),
     Screenshot,
+    StartRecording,
+    StopRecording,
     SaveShot,
     Logcat,
     ClearLogcat,
@@ -139,6 +158,7 @@ pub struct App {
     screen_tex: Option<TextureHandle>,
     screen_raw: Vec<u8>,
     screen_live: bool,
+    recording: RecordingState,
 
     forwards: String,
     snapshots: String,
@@ -205,6 +225,7 @@ impl App {
             screen_tex: None,
             screen_raw: Vec::new(),
             screen_live: false,
+            recording: RecordingState::Idle,
             forwards: String::new(),
             snapshots: String::new(),
             port_spec: String::new(),
@@ -350,6 +371,45 @@ impl App {
                     }
                     Err(e) => self.log(Level::Err, format!("screenshot tidak terbaca: {e}")),
                 },
+                Msg::RecordStarted {
+                    serial,
+                    remote_path,
+                    pid,
+                } => {
+                    self.recording = RecordingState::Recording {
+                        serial: serial.clone(),
+                        remote_path,
+                        pid,
+                    };
+                    self.log(Level::Ok, format!("screen record dimulai · {serial}"));
+                }
+                Msg::RecordStartFailed(error) => {
+                    self.recording = RecordingState::Idle;
+                    self.log(Level::Err, format!("screen record gagal dimulai: {error}"));
+                }
+                Msg::RecordStopped(path) => {
+                    self.recording = RecordingState::Idle;
+                    self.log(Level::Ok, format!("video disimpan: {}", path.display()));
+                    if let Err(error) = crate::proc::reveal(&path) {
+                        self.log(
+                            Level::Err,
+                            format!("video tersimpan, folder tidak bisa dibuka: {error}"),
+                        );
+                    }
+                }
+                Msg::RecordStopFailed {
+                    serial,
+                    remote_path,
+                    pid,
+                    error,
+                } => {
+                    self.recording = RecordingState::Recording {
+                        serial,
+                        remote_path,
+                        pid,
+                    };
+                    self.log(Level::Err, format!("rekaman gagal dihentikan: {error}"));
+                }
                 Msg::Logcat(text) => self.logcat = text,
                 Msg::Forwards(text) => self.forwards = text,
                 Msg::Snapshots(text) => self.snapshots = text,
@@ -621,6 +681,68 @@ impl App {
                         let _ = crate::proc::reveal(&path);
                     }
                     Err(e) => self.log(Level::Err, e.to_string()),
+                }
+            }
+            Act::StartRecording => {
+                let Some(serial) = self.target_serial() else {
+                    self.log(Level::Err, "target belum berjalan");
+                    return;
+                };
+                if !matches!(&self.recording, RecordingState::Idle) {
+                    self.log(Level::Err, "hentikan rekaman sebelumnya dulu");
+                    return;
+                }
+                self.recording = RecordingState::Starting {
+                    serial: serial.clone(),
+                };
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks
+                    .spawn(move |tx| match sdk::start_screen_recording(&sdk, &serial) {
+                        Ok((remote_path, pid)) => {
+                            let _ = tx.send(Msg::RecordStarted {
+                                serial,
+                                remote_path,
+                                pid,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Msg::RecordStartFailed(error.to_string()));
+                        }
+                    });
+            }
+            Act::StopRecording => {
+                let state = std::mem::replace(&mut self.recording, RecordingState::Idle);
+                if let RecordingState::Recording {
+                    serial,
+                    remote_path,
+                    pid,
+                } = state
+                {
+                    self.recording = RecordingState::Stopping {
+                        serial: serial.clone(),
+                    };
+                    let sdk = self.sdk.clone();
+                    let output_dir = out_dir();
+                    self.busy += 1;
+                    self.tasks.spawn(move |tx| {
+                        match sdk::stop_screen_recording(&sdk, &serial, &remote_path, pid, &output_dir)
+                        {
+                            Ok(path) => {
+                                let _ = tx.send(Msg::RecordStopped(path));
+                            }
+                            Err(error) => {
+                                let _ = tx.send(Msg::RecordStopFailed {
+                                    serial,
+                                    remote_path,
+                                    pid,
+                                    error: error.to_string(),
+                                });
+                            }
+                        }
+                    });
+                } else {
+                    self.recording = state;
                 }
             }
             Act::Logcat => {
@@ -1185,7 +1307,7 @@ impl App {
 
     fn tab_screen(&mut self, ui: &mut egui::Ui, serial: Option<&str>, act: &mut Option<Act>) {
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let live = serial.is_some();
             if ui.add_enabled(live, egui::Button::new("Capture")).clicked() {
                 *act = Some(Act::Screenshot);
@@ -1204,6 +1326,32 @@ impl App {
                         .color(MUTED)
                         .size(11.0),
                 );
+            }
+            ui.separator();
+            match &self.recording {
+                RecordingState::Idle => {
+                    if ui
+                        .add_enabled(live, egui::Button::new("Mulai rekam"))
+                        .clicked()
+                    {
+                        *act = Some(Act::StartRecording);
+                    }
+                    ui.label(RichText::new("maks. 3 menit").color(MUTED).size(11.0));
+                }
+                RecordingState::Starting { serial } => {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Menyiapkan rekaman · {serial}")).color(MUTED));
+                }
+                RecordingState::Recording { serial, .. } => {
+                    ui.label(RichText::new(format!("Merekam · {serial}")).color(BAD));
+                    if ui.button("Stop rekam").clicked() {
+                        *act = Some(Act::StopRecording);
+                    }
+                }
+                RecordingState::Stopping { serial, .. } => {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Menyimpan rekaman · {serial}")).color(MUTED));
+                }
             }
         });
         if serial.is_none() {

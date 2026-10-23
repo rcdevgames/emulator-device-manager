@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::proc;
 
@@ -805,6 +807,102 @@ pub fn screenshot(sdk: &Sdk, serial: &str) -> Result<Vec<u8>> {
     proc::run_bytes(adb, &["-s", serial, "exec-out", "screencap", "-p"])
 }
 
+/// Start Android's built-in recorder in the background, with its three-minute limit.
+pub fn start_screen_recording(sdk: &Sdk, serial: &str) -> Result<(String, u32)> {
+    let adb = sdk.adb.as_ref().context("adb not found")?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before Unix epoch")?
+        .as_millis();
+    let remote_path = format!("/sdcard/devmgr-screen-{stamp}.mp4");
+    let log_path = format!("{remote_path}.log");
+    let command =
+        format!("screenrecord --time-limit 180 {remote_path} >/dev/null 2>{log_path} & echo $!");
+    let output = proc::run(adb, &["-s", serial, "shell", &command])?;
+    let pid = parse_screenrecord_pid(&output)?;
+    let pid_text = pid.to_string();
+
+    // screenrecord fails immediately on devices without the encoder, and that
+    // failure would otherwise look like a successful start.
+    thread::sleep(Duration::from_millis(300));
+    if proc::run(adb, &["-s", serial, "shell", "kill", "-0", &pid_text]).is_err() {
+        let detail = proc::run_lossy(adb, &["-s", serial, "shell", "cat", &log_path]);
+        let _ = proc::run_lossy(
+            adb,
+            &["-s", serial, "shell", "rm", "-f", &remote_path, &log_path],
+        );
+        let detail = detail.trim();
+        if detail.is_empty() {
+            bail!("screenrecord langsung berhenti; device mungkin tidak mendukung adb shell screenrecord");
+        }
+        bail!("screenrecord gagal dimulai: {detail}");
+    }
+
+    Ok((remote_path, pid))
+}
+
+/// Stop the recorder, pull its MP4 beside the app, then remove the device copy.
+pub fn stop_screen_recording(
+    sdk: &Sdk,
+    serial: &str,
+    remote_path: &str,
+    pid: u32,
+    output_dir: &Path,
+) -> Result<PathBuf> {
+    let adb = sdk.adb.as_ref().context("adb not found")?;
+    let pid_text = pid.to_string();
+    // SIGINT makes screenrecord finalize the MP4 header before it exits.
+    if let Err(error) = proc::run(adb, &["-s", serial, "shell", "kill", "-2", &pid_text]) {
+        if proc::run(adb, &["-s", serial, "shell", "kill", "-0", &pid_text]).is_ok() {
+            return Err(error).context("kirim sinyal stop ke screenrecord");
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if proc::run(adb, &["-s", serial, "shell", "kill", "-0", &pid_text]).is_err() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("screenrecord belum berhenti setelah 10 detik; coba Stop rekam lagi");
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    std::fs::create_dir_all(output_dir).context("buat folder tujuan rekaman")?;
+    let filename = Path::new(remote_path)
+        .file_name()
+        .context("path rekaman di device tidak valid")?;
+    let local_path = output_dir.join(filename);
+    let local_text = local_path.to_string_lossy().into_owned();
+    proc::run(adb, &["-s", serial, "pull", remote_path, &local_text])
+        .context("unduh rekaman dari device")?;
+    if std::fs::metadata(&local_path)
+        .context("cek berkas rekaman hasil unduhan")?
+        .len()
+        == 0
+    {
+        bail!("berkas rekaman kosong");
+    }
+
+    let log_path = format!("{remote_path}.log");
+    let _ = proc::run(
+        adb,
+        &["-s", serial, "shell", "rm", "-f", remote_path, &log_path],
+    );
+    Ok(local_path)
+}
+
+/// `adb shell` prints the echo result last; anything else on stdout is noise.
+fn parse_screenrecord_pid(output: &str) -> Result<u32> {
+    output
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .context("screenrecord tidak mengembalikan pid")
+}
+
 pub fn install_apk(sdk: &Sdk, serial: &str, apk: &Path, reinstall: bool) -> Result<String> {
     let adb = sdk.adb.as_ref().context("adb not found")?;
     let apk = apk.to_string_lossy().to_string();
@@ -888,6 +986,20 @@ pub fn running_map(sdk: &Sdk, devices: &[Device]) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screenrecord_pid_uses_last_numeric_line() {
+        assert_eq!(
+            parse_screenrecord_pid("* daemon started successfully\n31415\n").unwrap(),
+            31415
+        );
+    }
+
+    #[test]
+    fn screenrecord_pid_rejects_zero_or_missing() {
+        assert!(parse_screenrecord_pid("0\n").is_err());
+        assert!(parse_screenrecord_pid("screenrecord failed\n").is_err());
+    }
 
     fn avd_from(lines: &[&str]) -> Avd {
         Avd {
