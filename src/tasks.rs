@@ -41,8 +41,8 @@ pub enum Msg {
     WsaPackages(Vec<String>),
     /// Result of the off-thread ADB port probe.
     WsaPort(bool),
-    /// Is the WSA package registered with Windows? `None` = PowerShell unsure.
-    WsaRegistered(Option<bool>),
+    /// What Windows reports about the WSA package; `None` = could not ask.
+    WsaRegistered(Option<crate::wsa::Registration>),
     /// One directory listing for the WSA file browser.
     WsaFiles {
         path: String,

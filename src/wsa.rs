@@ -263,21 +263,50 @@ pub fn force_stop(sdk: &Sdk, package: &str) -> Result<String> {
     proc::run(adb, &["-s", SERIAL, "shell", &cmd])
 }
 
-/// Is the WSA package registered for this user? `None` means PowerShell itself
-/// could not answer, so callers can fall back to a folder probe.
-pub fn registered() -> Option<bool> {
+/// What Windows reports about the WSA package.
+pub struct Registration {
+    pub installed: bool,
+    /// `InstallLocation` of the package, when Windows reports one.
+    pub location: Option<PathBuf>,
+}
+
+/// Ask Windows whether the package is registered.
+///
+/// `None` means the question could not be answered. `Get-AppxPackage` fails
+/// with "Access is denied" under some sandboxes and elevations and still exits
+/// 0, so a bare count of 0 would be misread as "not installed" — the answer is
+/// only trusted when the command really succeeded and said nothing on stderr.
+pub fn probe() -> Option<Registration> {
     let script = format!(
-        "@(Get-AppxPackage -Name '*{PACKAGE}*' -ErrorAction SilentlyContinue).Count"
+        "$ErrorActionPreference='Stop'; \
+         try {{ $p = @(Get-AppxPackage -Name '*{PACKAGE}*'); \
+         Write-Output $p.Count; \
+         if ($p.Count -gt 0) {{ Write-Output $p[0].InstallLocation }} }} \
+         catch {{ Write-Error $_.Exception.Message; exit 3 }}"
     );
     let out = proc::cmd("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .ok()?;
-    if !out.status.success() {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || !stderr.trim().is_empty() {
         return None;
     }
-    let count = String::from_utf8_lossy(&out.stdout);
-    count.trim().parse::<u32>().ok().map(|n| n > 0)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_probe(&stdout)
+}
+
+/// Split the script's two-line answer: package count, then InstallLocation.
+fn parse_probe(stdout: &str) -> Option<Registration> {
+    let mut lines = stdout.lines().map(str::trim).filter(|line| !line.is_empty());
+    let installed = match lines.next()?.parse::<u32>() {
+        Ok(count) => count > 0,
+        Err(_) => return None,
+    };
+    Some(Registration {
+        installed,
+        location: lines.next().map(PathBuf::from),
+    })
 }
 
 /// Register the package with Windows.
@@ -630,5 +659,29 @@ mod tests {
     fn manifest_or_bundle_is_enough_for_a_source_folder() {
         // No files on disk can satisfy this, so the probe must refuse.
         assert!(Wsa::from_root(PathBuf::from(r"C:\definitely\not\here")).is_none());
+    }
+
+    #[test]
+    fn probe_reads_count_and_install_location() {
+        let registration = parse_probe("1\r\nC:\\Users\\dev\\WSA\r\n").unwrap();
+        assert!(registration.installed);
+        assert_eq!(
+            registration.location.as_deref(),
+            Some(Path::new(r"C:\Users\dev\WSA"))
+        );
+    }
+
+    #[test]
+    fn probe_without_hits_is_not_installed() {
+        let registration = parse_probe("0\r\n").unwrap();
+        assert!(!registration.installed);
+        assert!(registration.location.is_none());
+    }
+
+    #[test]
+    fn probe_rejects_unusable_output() {
+        // A denied Get-AppxPackage prints an error, not a count.
+        assert!(parse_probe("").is_none());
+        assert!(parse_probe("Access is denied.\r\n").is_none());
     }
 }

@@ -332,8 +332,8 @@ impl App {
         self.pending_refresh = true;
         let sdk = self.sdk.clone();
         let want_defs = self.defs.is_empty();
-        // One PowerShell call per session is enough to learn the install state.
-        let probe_registered = self.wsa.is_some() && self.wsa_registered.is_none();
+        // Ask Windows once per session; Refresh resets it to ask again.
+        let probe_registered = self.wsa_registered.is_none();
         self.tasks.spawn(move |tx| {
             let _ = tx.send(Msg::Avds(sdk::list_avds(&sdk)));
             let devices = sdk::list_devices(&sdk);
@@ -345,7 +345,7 @@ impl App {
                 let _ = tx.send(Msg::Defs(sdk::list_device_defs(&sdk)));
             }
             if probe_registered {
-                let _ = tx.send(Msg::WsaRegistered(wsa::registered()));
+                let _ = tx.send(Msg::WsaRegistered(wsa::probe()));
             }
             let _ = tx.send(Msg::Refreshed);
         });
@@ -543,7 +543,30 @@ impl App {
                 Msg::WsaInfo(info) => self.wsa_info = info,
                 Msg::WsaPackages(list) => self.wsa_packages = list,
                 Msg::WsaPort(up) => self.wsa_port = up,
-                Msg::WsaRegistered(registered) => self.wsa_registered = registered,
+                Msg::WsaRegistered(state) => match state {
+                    Some(registration) => {
+                        self.wsa_registered = Some(registration.installed);
+                        // The registered location settles it when folder
+                        // probing found nothing (store installs, moved folders).
+                        if let Some(location) = registration.location {
+                            let current = self.wsa.as_ref().map(|w| w.root.clone());
+                            if current.as_deref() != Some(location.as_path()) {
+                                if let Some(found) = Wsa::from_root(location) {
+                                    self.wsa = Some(found);
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        // Windows refused to answer. Keep the folder verdict and
+                        // never block Start on a guess.
+                        self.wsa_registered = None;
+                        self.log(
+                            Level::Info,
+                            "status paket WSA tidak terbaca — pakai deteksi folder",
+                        );
+                    }
+                },
                 Msg::WsaFiles {
                     path,
                     entries,
@@ -642,6 +665,8 @@ impl App {
     fn apply(&mut self, act: Act) {
         match act {
             Act::Refresh => {
+                // Retry the package query: elevation and profiles can change.
+                self.wsa_registered = None;
                 self.refresh();
                 self.log(Level::Info, "refresh");
             }
@@ -1228,6 +1253,8 @@ impl App {
                 let sdk = self.sdk.clone();
                 self.busy += 1;
                 self.tasks.spawn(move |tx| {
+                    // Refresh doubles as the retry after an elevation change.
+                    let _ = tx.send(Msg::WsaRegistered(wsa::probe()));
                     let info = wsa::info(&sdk);
                     let _ = tx.send(Msg::WsaInfo(info));
                     let list = wsa::packages(&sdk);
@@ -1274,7 +1301,7 @@ impl App {
                             return;
                         }
                     }
-                    let _ = tx.send(Msg::WsaRegistered(wsa::registered()));
+                    let _ = tx.send(Msg::WsaRegistered(wsa::probe()));
                     let _ = tx.send(Msg::Refresh);
                 });
             }
@@ -1763,10 +1790,13 @@ impl App {
     fn tab_wsa(&mut self, ui: &mut egui::Ui, up: bool, act: &mut Option<Act>) {
         let installed = self.wsa_installed();
         let have_root = self.wsa.is_some();
+        // Windows can refuse the package query (denied access, elevation); then
+        // the folder probe decides and Install is not offered on a guess.
+        let unknown = self.wsa_registered.is_none();
         ui.add_space(8.0);
         ui.horizontal_wrapped(|ui| {
-            if !installed {
-                // Start only makes sense once Windows knows the package.
+            if !installed && !unknown {
+                // Only offered when Windows positively said "absent".
                 if ui
                     .add_enabled(have_root, egui::Button::new("Install"))
                     .clicked()
@@ -1781,10 +1811,18 @@ impl App {
                     *act = Some(Act::WsaRestart);
                 }
             } else {
-                if ui.button("Start").clicked() {
+                // The folder is what start really needs; a refused query must
+                // not lock these buttons.
+                if ui
+                    .add_enabled(have_root, egui::Button::new("Start"))
+                    .clicked()
+                {
                     *act = Some(Act::WsaStart);
                 }
-                if ui.button("Connect only").clicked() {
+                if ui
+                    .add_enabled(have_root, egui::Button::new("Connect only"))
+                    .clicked()
+                {
                     *act = Some(Act::WsaConnect);
                 }
             }
@@ -1809,7 +1847,7 @@ impl App {
             }
         });
         ui.add_space(4.0);
-        if !installed {
+        if !installed && !unknown {
             ui.label(
                 RichText::new(if have_root {
                     "Paket WSA belum terdaftar di Windows — klik Install untuk memasangnya."
@@ -1820,12 +1858,24 @@ impl App {
                 .color(WARN)
                 .size(11.0),
             );
-        } else if !up {
+        } else if !have_root {
             ui.label(
                 RichText::new(
-                    "Start menyalakan VM lewat WsaClient lalu menunggu ADB siap — \
-                     tidak perlu membuka aplikasi apa pun.",
+                    "WSA terpasang tapi folder installnya tidak ketemu — \
+                     klik Set folder… dan pilih folder WSA-nya.",
                 )
+                .color(WARN)
+                .size(11.0),
+            );
+        } else if !up {
+            ui.label(
+                RichText::new(if unknown {
+                    "Windows tidak memberi status paket (akses ditolak) — \
+                     folder WSA terdeteksi, Start tetap bisa dicoba."
+                } else {
+                    "Start menyalakan VM lewat WsaClient lalu menunggu ADB siap — \
+                     tidak perlu membuka aplikasi apa pun."
+                })
                 .color(MUTED)
                 .size(11.0),
             );
@@ -1858,7 +1908,7 @@ impl App {
         let registered = match self.wsa_registered {
             Some(true) => "ya",
             Some(false) => "belum",
-            None => "—",
+            None => "tidak terbaca",
         };
         egui::Grid::new("wsa-info")
             .num_columns(2)
