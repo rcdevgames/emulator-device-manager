@@ -1001,6 +1001,37 @@ mod tests {
         assert!(parse_screenrecord_pid("screenrecord failed\n").is_err());
     }
 
+    /// Scratch folder for tests that need real files.
+    ///
+    /// `%TEMP%` is not writable in every sandbox (a locked-down runner answers
+    /// `Access is denied`), so fall back to the build directory beside the
+    /// sources and prove the folder is writable before handing it out.
+    fn scratch(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!("devmgr-{tag}-{}-{stamp}", std::process::id());
+        let roots = [
+            std::env::temp_dir(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join("test-scratch"),
+        ];
+        for root in roots {
+            let dir = root.join(&name);
+            if std::fs::create_dir_all(&dir).is_err() {
+                continue;
+            }
+            let probe = dir.join(".probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return dir;
+            }
+        }
+        panic!("tidak ada folder yang bisa ditulis untuk test");
+    }
+
     fn avd_from(lines: &[&str]) -> Avd {
         Avd {
             name: "Test".into(),
@@ -1021,9 +1052,10 @@ mod tests {
         assert_eq!(avd.get("hw.ramSize").as_deref(), Some("2048"));
         assert_eq!(avd.api(), "36");
     }
+
     #[test]
     fn device_frame_defaults_to_disabled_when_key_is_missing() {
-        let base = std::env::temp_dir().join(format!("devmgr-frame-test-{}", std::process::id()));
+        let base = scratch("frame");
         let avd_dir = base.join("NoFrame.avd");
         std::fs::create_dir_all(&avd_dir).unwrap();
         std::fs::write(avd_dir.join("config.ini"), "AvdId=NoFrame\ntarget=android-36\n").unwrap();
@@ -1108,7 +1140,7 @@ mod tests {
     /// so `path=` in the `.ini` must win over the file stem.
     #[test]
     fn avd_dir_comes_from_ini_path() {
-        let base = std::env::temp_dir().join(format!("devmgr-test-{}", std::process::id()));
+        let base = scratch("avd");
         let avd_dir = base.join("Pixel_9_Pro.avd");
         std::fs::create_dir_all(&avd_dir).unwrap();
         std::fs::write(
