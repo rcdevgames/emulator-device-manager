@@ -7,6 +7,7 @@ use eframe::egui::{self, Align, Color32, CornerRadius, Layout, RichText, Texture
 use crate::sdk::{self, Avd, Device, DeviceDef, Sdk, SystemImage};
 use crate::settings::Settings;
 use crate::tasks::{Level, Msg, Tasks};
+use crate::wsa::{self, Wsa};
 
 const CARD: Color32 = Color32::from_rgb(32, 35, 41);
 const CARD_SEL: Color32 = Color32::from_rgb(38, 56, 78);
@@ -22,6 +23,8 @@ const WELL: Color32 = Color32::from_rgb(14, 16, 18);
 enum Target {
     Avd(String),
     Device(String),
+    /// The Windows Subsystem for Android VM, which has no AVD of its own.
+    Wsa,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -88,6 +91,25 @@ struct EditForm {
     data: String,
 }
 
+/// In-app browser over the guest filesystem; fed by `Msg::WsaFiles`.
+struct FilesWindow {
+    path: String,
+    entries: Vec<wsa::Entry>,
+    error: String,
+    loading: bool,
+}
+
+impl FilesWindow {
+    fn open(path: String) -> FilesWindow {
+        FilesWindow {
+            path,
+            entries: Vec::new(),
+            error: String::new(),
+            loading: true,
+        }
+    }
+}
+
 enum Act {
     Select(Target),
     Refresh,
@@ -126,6 +148,20 @@ enum Act {
     ListForwards,
     ListSnapshots,
     Settings,
+    // --- WSA
+    WsaStart,
+    WsaStop,
+    WsaRestart,
+    WsaConnect,
+    WsaPickRoot,
+    WsaStartApp(String),
+    WsaStopApp(String),
+    WsaRefreshApps,
+    WsaInstall,
+    WsaReveal,
+    WsaFilesOpen,
+    WsaFilesList(String),
+    WsaFilesPull(String),
 }
 
 pub struct App {
@@ -178,6 +214,21 @@ pub struct App {
     last_live: Instant,
     log_open: bool,
     frame_times: Vec<f32>,
+
+    /// WSA install, resolved once per settings change.
+    wsa: Option<Wsa>,
+    wsa_info: Option<crate::wsa::Info>,
+    wsa_packages: Vec<String>,
+    /// Cached result of the ADB port probe, refreshed off the UI thread only.
+    wsa_port: bool,
+    /// Action queued by a worker callback, applied at the start of the next frame.
+    queued: Option<Act>,
+    /// Set when autostart was requested; consumed by the first poll.
+    wsa_autostart_pending: bool,
+    /// Is the WSA package registered with Windows? `None` = probe still running.
+    wsa_registered: Option<bool>,
+    /// The Android-side file browser window, when open.
+    files: Option<FilesWindow>,
 }
 
 impl App {
@@ -199,9 +250,11 @@ impl App {
         } else {
             Sdk::from_root(PathBuf::from(settings.sdk_override.trim()))
         };
+        let wsa = Wsa::discover(&settings.wsa_root);
 
         let mut app = App {
             sdk,
+            wsa,
             settings_draft: settings.clone(),
             settings,
             tasks: Tasks::new(),
@@ -241,7 +294,23 @@ impl App {
             last_live: Instant::now(),
             log_open: true,
             frame_times: Vec::new(),
+            wsa_info: None,
+            wsa_packages: Vec::new(),
+            wsa_port: false,
+            queued: None,
+            wsa_autostart_pending: false,
+            wsa_registered: None,
+            files: None,
         };
+        if app.wsa.is_none() {
+            app.log(
+                Level::Info,
+                "WSA tidak terdeteksi — set folder install WSA di Settings",
+            );
+        }
+        // Autostart must not run adb from the constructor: the window is not up
+        // yet and every adb call costs ~0.2 s. The first poll starts it instead.
+        app.wsa_autostart_pending = app.settings.wsa_autostart && app.wsa.is_some();
         let missing = app.sdk.missing();
         for m in missing {
             app.log(Level::Err, format!("{m} tidak ditemukan — set path SDK di Settings"));
@@ -263,6 +332,8 @@ impl App {
         self.pending_refresh = true;
         let sdk = self.sdk.clone();
         let want_defs = self.defs.is_empty();
+        // One PowerShell call per session is enough to learn the install state.
+        let probe_registered = self.wsa.is_some() && self.wsa_registered.is_none();
         self.tasks.spawn(move |tx| {
             let _ = tx.send(Msg::Avds(sdk::list_avds(&sdk)));
             let devices = sdk::list_devices(&sdk);
@@ -273,6 +344,9 @@ impl App {
             if want_defs {
                 let _ = tx.send(Msg::Defs(sdk::list_device_defs(&sdk)));
             }
+            if probe_registered {
+                let _ = tx.send(Msg::WsaRegistered(wsa::registered()));
+            }
             let _ = tx.send(Msg::Refreshed);
         });
     }
@@ -282,10 +356,16 @@ impl App {
         self.busy += 1;
         self.pending_poll = true;
         let sdk = self.sdk.clone();
+        let probe_wsa = self.wsa.is_some();
         self.tasks.spawn(move |tx| {
             let devices = sdk::list_devices(&sdk);
             let _ = tx.send(Msg::Running(sdk::running_map(&sdk, &devices)));
             let _ = tx.send(Msg::Devices(devices));
+            // The port probe is a TCP connect; it belongs on the worker, not
+            // in a frame. 40 ms cap keeps a closed port cheap.
+            if probe_wsa {
+                let _ = tx.send(Msg::WsaPort(wsa::port_open()));
+            }
             let _ = tx.send(Msg::Polled);
         });
     }
@@ -294,6 +374,13 @@ impl App {
         match t {
             Target::Device(s) => Some(s.clone()),
             Target::Avd(n) => self.running.get(n).cloned(),
+            // WSA only answers on its serial once `adb connect` has run, so
+            // trust the device list rather than the port alone.
+            Target::Wsa => self
+                .devices
+                .iter()
+                .find(|d| d.serial == wsa::SERIAL && d.state == "device")
+                .map(|d| d.serial.clone()),
         }
     }
 
@@ -303,6 +390,47 @@ impl App {
 
     fn avd(&self, name: &str) -> Option<&Avd> {
         self.avds.iter().find(|a| a.name == name)
+    }
+
+    /// WSA is "up" when its serial is live in the device list. The port probe
+    /// runs on a worker and lands in `wsa_port`, so the render path never
+    /// touches the network.
+    fn wsa_port_up(&self) -> bool {
+        self.devices
+            .iter()
+            .any(|d| d.serial == wsa::SERIAL && d.state == "device")
+            || self.wsa_port
+    }
+
+    /// WSA can only start once Windows has the package registered. While the
+    /// probe is still running, folder detection is the best answer available.
+    fn wsa_installed(&self) -> bool {
+        match self.wsa_registered {
+            Some(registered) => registered,
+            None => self.wsa.is_some(),
+        }
+    }
+
+    /// Load one guest directory for the file browser.
+    fn load_remote_dir(&mut self, path: String) {
+        if let Some(files) = &mut self.files {
+            files.path = path.clone();
+            files.error.clear();
+            files.loading = true;
+        }
+        let sdk = self.sdk.clone();
+        self.busy += 1;
+        self.tasks.spawn(move |tx| {
+            let (entries, error) = match wsa::list_dir(&sdk, &path) {
+                Ok(list) => (list, String::new()),
+                Err(e) => (Vec::new(), e.to_string()),
+            };
+            let _ = tx.send(Msg::WsaFiles {
+                path,
+                entries,
+                error,
+            });
+        });
     }
 
     fn pump(&mut self, ctx: &egui::Context) {
@@ -328,8 +456,7 @@ impl App {
                             self.target = None;
                         }
                     }
-                }
-                Msg::Running(map) => self.running = map,
+                }                Msg::Running(map) => self.running = map,
                 Msg::Images(list) => {
                     self.images = list;
                     let available: Vec<String> =
@@ -413,10 +540,55 @@ impl App {
                 Msg::Logcat(text) => self.logcat = text,
                 Msg::Forwards(text) => self.forwards = text,
                 Msg::Snapshots(text) => self.snapshots = text,
+                Msg::WsaInfo(info) => self.wsa_info = info,
+                Msg::WsaPackages(list) => self.wsa_packages = list,
+                Msg::WsaPort(up) => self.wsa_port = up,
+                Msg::WsaRegistered(registered) => self.wsa_registered = registered,
+                Msg::WsaFiles {
+                    path,
+                    entries,
+                    error,
+                } => {
+                    if let Some(files) = &mut self.files {
+                        files.path = path;
+                        files.entries = entries;
+                        files.error = error;
+                        files.loading = false;
+                    }
+                }
+                Msg::WsaPulled { local, error } => {
+                    if error.is_empty() {
+                        self.log(Level::Ok, format!("disimpan: {}", local.display()));
+                        if let Err(e) = crate::proc::reveal(&local) {
+                            self.log(
+                                Level::Err,
+                                format!("file tersimpan, folder gagal dibuka: {e}"),
+                            );
+                        }
+                    } else {
+                        self.log(Level::Err, format!("pull gagal: {error}"));
+                    }
+                }
                 // Long tasks ask for a reload; the UI only schedules the worker.
                 Msg::Refresh => self.refresh(),
                 Msg::Refreshed => self.pending_refresh = false,
-                Msg::Polled => self.pending_poll = false,
+                Msg::Polled => {
+                    self.pending_poll = false;
+                    // Never start work from inside `pump`; queue it and let the
+                    // next frame apply it so the message loop stays cheap.
+                    if self.wsa_autostart_pending {
+                        self.wsa_autostart_pending = false;
+                        if self.wsa_installed() {
+                            // The VM is usually down on launch, so boot it
+                            // rather than only registering adb on a dead port.
+                            self.queued = Some(if self.wsa_port_up() {
+                                Act::WsaConnect
+                            } else {
+                                Act::WsaStart
+                            });
+                        }
+                    }
+                }
                 Msg::Lived => self.pending_live = false,
             }
         }
@@ -899,6 +1071,230 @@ impl App {
                 self.settings_draft = self.settings.clone();
                 self.settings_open = true;
             }
+            // ------------------------------------------------------------- WSA
+            Act::WsaStart => {
+                if !self.wsa_installed() {
+                    self.log(Level::Err, "WSA belum terpasang — klik Install dulu");
+                    return;
+                }
+                let Some(wsa) = self.wsa.clone() else {
+                    self.log(Level::Err, "WSA tidak terdeteksi");
+                    return;
+                };
+                self.log(Level::Info, "start WSA");
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    if let Err(e) = wsa::ensure_client(&wsa).and_then(|_| wsa.start()) {
+                        let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                        return;
+                    }
+                    let _ = tx.send(Msg::Log(
+                        Level::Info,
+                        "WsaClient dijalankan, menunggu ADB…".to_string(),
+                    ));
+                    // A cold boot takes well under a minute; the emulator start
+                    // path uses two, so match that budget.
+                    if wsa::wait_ready(&sdk, Duration::from_secs(120)) {
+                        let _ = tx.send(Msg::Log(
+                            Level::Ok,
+                            "WSA siap · adb tersambung".to_string(),
+                        ));
+                    } else {
+                        let _ = tx.send(Msg::Log(
+                            Level::Err,
+                            "WSA belum menjawab ADB setelah 120 s — cek WsaClient".to_string(),
+                        ));
+                    }
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaStop => {
+                let Some(wsa) = self.wsa.clone() else { return };
+                let sdk = self.sdk.clone();
+                self.log(Level::Info, "stop WSA");
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    match wsa.stop(&sdk) {
+                        Ok(_) => {
+                            let _ = tx.send(Msg::Log(Level::Ok, "WSA dimatikan".to_string()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(3));
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaRestart => {
+                let Some(wsa) = self.wsa.clone() else { return };
+                let sdk = self.sdk.clone();
+                self.log(Level::Info, "restart WSA");
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    if let Err(e) = wsa.restart(&sdk) {
+                        let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                        return;
+                    }
+                    // The bridge survives a guest reboot once connected, but
+                    // adb drops its transport, so re-register it.
+                    std::thread::sleep(Duration::from_secs(8));
+                    if wsa::wait_ready(&sdk, Duration::from_secs(120)) {
+                        let _ = tx.send(Msg::Log(Level::Ok, "WSA sudah restart".to_string()));
+                    } else {
+                        let _ = tx.send(Msg::Log(
+                            Level::Err,
+                            "WSA tidak kembali setelah restart".to_string(),
+                        ));
+                    }
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaConnect => {
+                // Cheap and idempotent: this is what makes the serial appear.
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    match wsa::connect(&sdk) {
+                        Ok(out) => {
+                            let _ = tx.send(Msg::Log(Level::Info, out.trim().to_string()));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                        }
+                    }
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaPickRoot => {
+                let picked = rfd::FileDialog::new()
+                    .set_title("Pilih folder install WSA")
+                    .pick_folder();
+                let Some(dir) = picked else { return };
+                self.settings_draft.wsa_root = dir.to_string_lossy().to_string();
+                self.settings.wsa_root = self.settings_draft.wsa_root.clone();
+                // Remembered immediately: the install state lives in this folder.
+                self.settings.save();
+                self.wsa = Wsa::discover(&self.settings.wsa_root);
+                self.wsa_registered = None;
+                match &self.wsa {
+                    Some(w) => {
+                        self.log(Level::Ok, format!("folder WSA: {}", w.root.display()));
+                        self.refresh();
+                    }
+                    None => self.log(
+                        Level::Err,
+                        format!(
+                            "{} tidak berisi AppxManifest.xml atau paket WSA",
+                            self.settings.wsa_root
+                        ),
+                    ),
+                }
+            }
+            Act::WsaStartApp(package) => {
+                let sdk = self.sdk.clone();
+                self.log(Level::Info, format!("launch {package}"));
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    match wsa::start_app(&sdk, &package) {
+                        Ok(out) => {
+                            let _ = tx.send(Msg::Log(Level::Ok, format!("{package} dijalankan · {out}")));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Log(Level::Err, format!("{package}: {e}")));
+                        }
+                    }
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaStopApp(package) => {
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    match wsa::force_stop(&sdk, &package) {
+                        Ok(_) => {
+                            let _ = tx.send(Msg::Log(Level::Ok, format!("{package} dihentikan")));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                        }
+                    }
+                    let list = wsa::packages(&sdk);
+                    let _ = tx.send(Msg::WsaPackages(list));
+                });
+            }
+            Act::WsaRefreshApps => {
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    let info = wsa::info(&sdk);
+                    let _ = tx.send(Msg::WsaInfo(info));
+                    let list = wsa::packages(&sdk);
+                    let _ = tx.send(Msg::WsaPackages(list));
+                });
+            }
+            Act::WsaReveal => {
+                let Some(wsa) = self.wsa.clone() else {
+                    self.log(Level::Err, "folder WSA belum diset");
+                    return;
+                };
+                if let Err(e) = crate::proc::reveal(&wsa.root) {
+                    self.log(Level::Err, format!("folder gagal dibuka: {e}"));
+                }
+            }
+            Act::WsaInstall => {
+                let root = self
+                    .wsa
+                    .as_ref()
+                    .map(|w| w.root.clone())
+                    .or_else(|| {
+                        let root = self.settings.wsa_root.trim();
+                        (!root.is_empty()).then(|| PathBuf::from(root))
+                    });
+                let Some(root) = root else {
+                    self.log(Level::Err, "set folder WSA dulu, lalu klik Install");
+                    return;
+                };
+                self.log(Level::Info, format!("install WSA dari {}", root.display()));
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    match wsa::install(&root) {
+                        Ok(out) => {
+                            let _ = tx.send(Msg::Log(
+                                Level::Ok,
+                                "WSA terdaftar di Windows".to_string(),
+                            ));
+                            for line in out.lines().filter(|l| !l.trim().is_empty()).take(4) {
+                                let _ = tx.send(Msg::Log(Level::Info, line.trim().to_string()));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Log(Level::Err, e.to_string()));
+                            return;
+                        }
+                    }
+                    let _ = tx.send(Msg::WsaRegistered(wsa::registered()));
+                    let _ = tx.send(Msg::Refresh);
+                });
+            }
+            Act::WsaFilesOpen => {
+                let path = wsa::FILES_HOME.to_string();
+                self.files = Some(FilesWindow::open(path.clone()));
+                self.load_remote_dir(path);
+            }
+            Act::WsaFilesList(path) => self.load_remote_dir(path),
+            Act::WsaFilesPull(remote) => {
+                let sdk = self.sdk.clone();
+                self.busy += 1;
+                self.tasks.spawn(move |tx| {
+                    let (local, error) = match wsa::pull(&sdk, &remote, &out_dir()) {
+                        Ok(local) => (local, String::new()),
+                        Err(e) => (PathBuf::new(), e.to_string()),
+                    };
+                    let _ = tx.send(Msg::WsaPulled { local, error });
+                });
+            }
         }
     }
 
@@ -915,6 +1311,11 @@ impl App {
         for m in missing {
             self.log(Level::Err, format!("{m} masih belum ditemukan"));
         }
+        self.wsa = Wsa::discover(&self.settings.wsa_root);
+        self.wsa_registered = None;
+        if self.wsa.is_none() {
+            self.log(Level::Info, "WSA tidak terdeteksi");
+        }
         self.log(Level::Ok, "settings disimpan");
         self.refresh();
     }
@@ -924,6 +1325,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.pump(&ctx);
+        // Actions queued by worker callbacks run here, once per frame, instead
+        // of mid-pump.
+        if let Some(act) = self.queued.take() {
+            self.apply(act);
+        }
         self.auto_refresh(&ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -1039,6 +1445,49 @@ impl App {
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(6.0);
+                        ui.label(RichText::new("Windows Subsystem").strong().size(12.5));
+                        match &self.wsa {
+                            Some(w) => {
+                                // Read the cached flag, never probe the port here:
+                                // a TCP connect inside the render path drops frames.
+                                let up = self.wsa_port_up();
+                                let installed = self.wsa_installed();
+                                let version = if w.version.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", w.version)
+                                };
+                                if wsa_card(
+                                    ui,
+                                    up,
+                                    installed,
+                                    self.target == Some(Target::Wsa),
+                                    &version,
+                                ) {
+                                    picks.push(Target::Wsa);
+                                }
+                                if !installed {
+                                    ui.add_space(4.0);
+                                    if ui.button("Install WSA").clicked() {
+                                        *act = Some(Act::WsaInstall);
+                                    }
+                                }
+                            }
+                            None => {
+                                ui.label(
+                                    RichText::new("WSA belum terpasang")
+                                        .color(MUTED)
+                                        .size(11.0),
+                                );
+                                if ui.button("Set folder WSA…").clicked() {
+                                    *act = Some(Act::WsaPickRoot);
+                                }
+                            }
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(6.0);
                         ui.label(
                             RichText::new(format!("Connected · {}", self.devices.len()))
                                 .strong()
@@ -1052,6 +1501,10 @@ impl App {
                             );
                         }
                         for dev in &self.devices {
+                            // The WSA row above already represents this serial.
+                            if dev.serial == wsa::SERIAL {
+                                continue;
+                            }
                             let selected = self.target == Some(Target::Device(dev.serial.clone()));
                             if device_card(ui, dev, selected) {
                                 picks.push(Target::Device(dev.serial.clone()));
@@ -1130,6 +1583,7 @@ impl App {
                 let title = match &target {
                     Target::Avd(n) => n.clone(),
                     Target::Device(s) => s.clone(),
+                    Target::Wsa => "Windows Subsystem for Android".to_string(),
                 };
                 ui.label(RichText::new(title).strong().size(18.0));
                 match &serial {
@@ -1301,6 +1755,173 @@ impl App {
                         kv(ui, "Kind", if dev.is_emulator { "emulator" } else { "physical" });
                         kv(ui, "AVD", &avd);
                     });
+            }
+            Target::Wsa => self.tab_wsa(ui, serial.is_some(), act),
+        }
+    }
+
+    fn tab_wsa(&mut self, ui: &mut egui::Ui, up: bool, act: &mut Option<Act>) {
+        let installed = self.wsa_installed();
+        let have_root = self.wsa.is_some();
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            if !installed {
+                // Start only makes sense once Windows knows the package.
+                if ui
+                    .add_enabled(have_root, egui::Button::new("Install"))
+                    .clicked()
+                {
+                    *act = Some(Act::WsaInstall);
+                }
+            } else if up {
+                if ui.button("Stop").clicked() {
+                    *act = Some(Act::WsaStop);
+                }
+                if ui.button("Restart").clicked() {
+                    *act = Some(Act::WsaRestart);
+                }
+            } else {
+                if ui.button("Start").clicked() {
+                    *act = Some(Act::WsaStart);
+                }
+                if ui.button("Connect only").clicked() {
+                    *act = Some(Act::WsaConnect);
+                }
+            }
+            if ui.button("Set folder…").clicked() {
+                *act = Some(Act::WsaPickRoot);
+            }
+            // Android's own file manager, not the Windows install folder.
+            if ui
+                .add_enabled(up, egui::Button::new("Open Folder"))
+                .clicked()
+            {
+                *act = Some(Act::WsaFilesOpen);
+            }
+            if ui
+                .add_enabled(have_root, egui::Button::new("Buka install dir"))
+                .clicked()
+            {
+                *act = Some(Act::WsaReveal);
+            }
+            if ui.button("Refresh").clicked() {
+                *act = Some(Act::WsaRefreshApps);
+            }
+        });
+        ui.add_space(4.0);
+        if !installed {
+            ui.label(
+                RichText::new(if have_root {
+                    "Paket WSA belum terdaftar di Windows — klik Install untuk memasangnya."
+                } else {
+                    "Folder WSA belum diset — klik Set folder… lalu pilih folder hasil \
+                     MagiskOnWSALocal (berisi AppxManifest.xml)."
+                })
+                .color(WARN)
+                .size(11.0),
+            );
+        } else if !up {
+            ui.label(
+                RichText::new(
+                    "Start menyalakan VM lewat WsaClient lalu menunggu ADB siap — \
+                     tidak perlu membuka aplikasi apa pun.",
+                )
+                .color(MUTED)
+                .size(11.0),
+            );
+        }
+
+        ui.add_space(12.0);
+        let wsa_root = self
+            .wsa
+            .as_ref()
+            .map(|w| w.root.display().to_string())
+            .unwrap_or_else(|| "(tidak terdeteksi)".into());
+        let client = self
+            .wsa
+            .as_ref()
+            .map(|w| {
+                w.client_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(paket store)".to_string())
+            })
+            .unwrap_or_default();
+        let version = self
+            .wsa
+            .as_ref()
+            .map(|w| w.version.clone())
+            .unwrap_or_default();
+        let release = self.wsa_info.as_ref().map(|i| i.release.clone());
+        let abi = self.wsa_info.as_ref().map(|i| i.abi.clone());
+        let model = self.wsa_info.as_ref().map(|i| i.model.clone());
+        let magisk = self.wsa_info.as_ref().map(|i| i.magisk);
+        let registered = match self.wsa_registered {
+            Some(true) => "ya",
+            Some(false) => "belum",
+            None => "—",
+        };
+        egui::Grid::new("wsa-info")
+            .num_columns(2)
+            .spacing([18.0, 7.0])
+            .show(ui, |ui| {
+                kv(ui, "Status", if up { "running" } else { "stopped" });
+                kv(ui, "Terpasang", registered);
+                kv(ui, "Serial", wsa::SERIAL);
+                kv(ui, "Package version", &version);
+                kv(ui, "Android", release.as_deref().unwrap_or("—"));
+                kv(ui, "ABI", abi.as_deref().unwrap_or("—"));
+                kv(ui, "Model", model.as_deref().unwrap_or("—"));
+                kv(
+                    ui,
+                    "Root",
+                    match magisk {
+                        Some(true) => "magisk",
+                        Some(false) => "tidak ada",
+                        None => "—",
+                    },
+                );
+                kv(ui, "Install dir", &wsa_root);
+                kv(ui, "Client", &client);
+            });
+
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Applications").strong().size(12.5));
+            ui.label(
+                RichText::new(format!("{} terpasang", self.wsa_packages.len()))
+                    .color(MUTED)
+                    .size(11.0),
+            );
+            if ui.add_enabled(up, egui::Button::new("Muat ulang")).clicked() {
+                *act = Some(Act::WsaRefreshApps);
+            }
+        });
+        ui.add_space(4.0);
+        if !up {
+            ui.label(
+                RichText::new("nyalakan WSA untuk membaca daftar aplikasi")
+                    .color(MUTED)
+                    .size(11.0),
+            );
+        } else if self.wsa_packages.is_empty() {
+            ui.label(
+                RichText::new("belum ada aplikasi pihak ketiga")
+                    .color(MUTED)
+                    .size(11.0),
+            );
+        } else {
+            for package in &self.wsa_packages {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(package).monospace().size(11.5));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Stop").clicked() {
+                            *act = Some(Act::WsaStopApp(package.clone()));
+                        }
+                        if ui.button("Launch").clicked() {
+                            *act = Some(Act::WsaStartApp(package.clone()));
+                        }
+                    });
+                });
             }
         }
     }
@@ -1507,6 +2128,7 @@ impl App {
         self.create_modal(ctx, act);
         self.edit_modal(ctx, act);
         self.delete_modal(ctx, act);
+        self.files_modal(ctx, act);
         self.settings_modal(ctx);
     }
 
@@ -1850,6 +2472,30 @@ impl App {
                         ui.label("Live interval");
                         ui.add(egui::Slider::new(&mut self.settings_draft.live_ms, 400..=5000));
                         ui.end_row();
+                        ui.label("WSA root");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.settings_draft.wsa_root)
+                                    .hint_text("kosong = auto-deteksi")
+                                    .desired_width(290.0),
+                            );
+                            if ui.small_button("Browse").clicked() {
+                                let picked = rfd::FileDialog::new()
+                                    .set_title("Pilih folder install WSA")
+                                    .pick_folder();
+                                if let Some(dir) = picked {
+                                    self.settings_draft.wsa_root =
+                                        dir.to_string_lossy().to_string();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("WSA autostart");
+                        ui.checkbox(
+                            &mut self.settings_draft.wsa_autostart,
+                            "nyalakan saat panel dibuka",
+                        );
+                        ui.end_row();
                     });
                 ui.add_space(10.0);
                 let dump = format!(
@@ -1882,6 +2528,134 @@ impl App {
         if save {
             self.save_settings();
             self.settings_open = false;
+        }
+    }
+
+    /// Android's file manager: browse the guest filesystem and pull files out.
+    fn files_modal(&mut self, ctx: &egui::Context, act: &mut Option<Act>) {
+        let Some(mut files) = self.files.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        let mut navigate: Option<String> = None;
+        let mut pull: Option<String> = None;
+
+        egui::Window::new("File Android · WSA")
+            .open(&mut open)
+            .collapsible(false)
+            .default_size([640.0, 460.0])
+            .min_size([420.0, 300.0])
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Up").clicked() {
+                        navigate = Some(wsa::parent(&files.path));
+                    }
+                    if ui.button("/sdcard").clicked() {
+                        navigate = Some(wsa::FILES_HOME.to_string());
+                    }
+                    if ui.button("/").clicked() {
+                        navigate = Some("/".to_string());
+                    }
+                    let edited = ui.add(
+                        egui::TextEdit::singleline(&mut files.path)
+                            .hint_text("/sdcard/DCIM")
+                            .desired_width(300.0),
+                    );
+                    if edited.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        navigate = Some(files.path.trim().to_string());
+                    }
+                    if ui.button("Refresh").clicked() {
+                        navigate = Some(files.path.clone());
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                if files.loading {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new("membaca…").color(MUTED).size(11.5));
+                    });
+                }
+                if !files.error.is_empty() {
+                    ui.label(RichText::new(&files.error).color(BAD).size(11.5));
+                }
+                let mut rows = 0usize;
+                egui::ScrollArea::vertical()
+                    .id_salt("wsa-files")
+                    .max_height(340.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in &files.entries {
+                            rows += 1;
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(if entry.enterable() { "dir" } else { "file" })
+                                        .color(MUTED)
+                                        .size(10.5)
+                                        .monospace(),
+                                );
+                                let name = RichText::new(&entry.name).size(12.0).monospace();
+                                if ui.selectable_label(false, name).clicked() {
+                                    if entry.enterable() {
+                                        navigate = Some(wsa::child(&files.path, &entry.name));
+                                    } else {
+                                        pull = Some(wsa::child(&files.path, &entry.name));
+                                    }
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if entry.enterable() {
+                                        if ui.small_button("Masuk").clicked() {
+                                            navigate =
+                                                Some(wsa::child(&files.path, &entry.name));
+                                        }
+                                    } else {
+                                        if ui.small_button("Simpan").clicked() {
+                                            pull = Some(wsa::child(&files.path, &entry.name));
+                                        }
+                                        ui.label(
+                                            RichText::new(wsa::human_size(entry.size))
+                                                .color(MUTED)
+                                                .size(11.0),
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    });
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} entri · simpan ke {}",
+                            rows,
+                            out_dir().display()
+                        ))
+                        .color(MUTED)
+                        .size(10.5),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.button("Tutup").clicked() {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if open && !close {
+            self.files = Some(files);
+        } else {
+            self.files = None;
+        }
+        if let Some(remote) = pull {
+            *act = Some(Act::WsaFilesPull(remote));
+        }
+        if let Some(path) = navigate {
+            *act = Some(Act::WsaFilesList(path));
         }
     }
 }
@@ -1962,6 +2736,37 @@ fn avd_card(ui: &mut egui::Ui, avd: &Avd, serial: Option<&str>, selected: bool) 
             ))
             .color(MUTED)
             .size(10.5),
+        );
+    })
+}
+
+fn wsa_card(ui: &mut egui::Ui, up: bool, installed: bool, selected: bool, version: &str) -> bool {
+    card(ui, selected, |ui| {
+        ui.horizontal(|ui| {
+            let dot = if up {
+                GOOD
+            } else if installed {
+                MUTED
+            } else {
+                WARN
+            };
+            ui.label(RichText::new("*").color(dot).size(14.0));
+            ui.label(RichText::new("WSA").strong().size(13.5));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let (text, color) = if !installed {
+                    ("belum terpasang", WARN)
+                } else if up {
+                    ("running", GOOD)
+                } else {
+                    ("stopped", MUTED)
+                };
+                ui.label(RichText::new(text).color(color).size(10.5));
+            });
+        });
+        ui.label(
+            RichText::new(format!("{} · Android VM{}", wsa::SERIAL, version))
+                .color(MUTED)
+                .size(10.5),
         );
     })
 }

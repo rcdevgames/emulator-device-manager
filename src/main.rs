@@ -5,6 +5,7 @@ mod proc;
 mod sdk;
 mod settings;
 mod tasks;
+mod wsa;
 
 use eframe::egui;
 

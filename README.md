@@ -39,9 +39,81 @@ $env:RUSTFLAGS = "-C link-arg=-L$((Resolve-Path .linkshim).Path)"
 | Install | `adb install` (opsional `-r`), pilih file atau drag & drop `.apk` ke jendela |
 | Ports | `adb forward` / `adb reverse`, add / remove / list |
 | Snapshots | daftar snapshot AVD lewat `emulator -snapshot-list` |
+| WSA | install / start / stop / restart VM, `adb connect 127.0.0.1:58526`, daftar & launch aplikasi, browse file Android |
 
 Refresh device berjalan otomatis tiap 2 detik; tab Screen/Logcat punya interval live
 sendiri (Settings → Live interval).
+
+## WSA
+
+Windows Subsystem for Android tampil sebagai target sendiri di sidebar. Bedanya dengan
+AVD: serial `127.0.0.1:58526` tidak pernah muncul di `adb devices` sampai ada yang
+menjalankan `adb connect`, jadi panel melakukannya sendiri setelah VM hidup.
+
+Lokasi install dicari berurutan: `wsa_root` di settings, path `WsaService` dari
+`sc qc WsaService`, lalu `%USERPROFILE%\WSA`. Yang dipakai adalah `WsaClient\WsaClient.exe`
+dari folder itu, jadi install MagiskOnWSALocal maupun paket Store sama-sama jalan.
+
+Folder itu juga yang dipakai tombol **Set folder…**, dan nilainya langsung disimpan ke
+`settings.ini` supaya tidak perlu diisi ulang.
+
+Status pemasangan dibaca dari Windows (`Get-AppxPackage *WindowsSubsystemForAndroid*`),
+jadi tombol menyesuaikan keadaan:
+
+| Kondisi | Tombol |
+| --- | --- |
+| folder belum diset | `Set folder…` |
+| folder ada, paket belum terdaftar | `Install` |
+| paket terdaftar, VM mati | `Start`, `Connect only` |
+| VM hidup | `Stop`, `Restart` |
+
+`Install` menjalankan `Add-AppxPackage -Register AppxManifest.xml` di dalam folder
+(layout MagiskOnWSALocal), atau `Add-AppxPackage -Path` bila folder hanya berisi
+`.msixbundle`. Sesudah terdaftar, Start baru diaktifkan.
+
+`Open Folder` membuka file manager Android di dalam panel — bukan folder install di
+Windows. Isinya `adb shell ls -lAp` mulai dari `/sdcard`, bisa naik direktori atau
+mengetik path langsung, dan `Simpan` menarik file ke `devmgr-out/` lalu membuka
+foldernya. Folder install Windows punya tombol sendiri: `Buka install dir`.
+
+Tombol di tab Overview:
+
+| Aksi | Perintah |
+| --- | --- |
+| Install | `Add-AppxPackage -Register AppxManifest.xml` (atau `-Path` untuk `.msixbundle`) |
+| Start | aktivasi `wsa://systemsettings`, lalu tunggu port 58526 dan `adb connect` |
+| Stop | `shell reboot -p`, tunggu port tutup, lalu `sc stop WsaService` dan bunuh `WsaClient`/`WsaSettings` |
+| Restart | `adb -s 127.0.0.1:58526 shell reboot` |
+| Open Folder | `adb shell ls -lAp <path>` (browser file Android, mulai `/sdcard`) |
+| Buka install dir | buka folder install WSA di Explorer |
+| Launch app | `monkey -p <paket> -c android.intent.category.LAUNCHER 1` |
+| Simpan | `adb pull <file>` ke `devmgr-out/` |
+
+Stop butuh langkah tambahan karena `reboot -p` hanya mematikan Android: `vmmemWSA`
+(±1,7 GB) dan `WsaClient` biasanya masih hidup sesudahnya, jadi RAM tidak pernah
+kembali. Services + proses sisa dibereskan supaya Start berikutnya benar-benar cold
+boot. Siklus Stop lalu Start terukur: VM hilang total, kembali siap dalam ±10 detik.
+
+Start **tidak** boleh memanggil `WsaClient.exe` langsung. Yang terjadi pada mesin ini:
+
+| Cara start | Hasil |
+| --- | --- |
+| `CreateProcess WsaClient.exe`, cwd sembarang | `gfxstream_backend.dll was not found`, proses mati diam-diam |
+| `CreateProcess WsaClient.exe`, cwd = folder install | exit `0xC0000409` (ucrtbase BEX64, unhandled abort) |
+| aktivasi `wsa://` lewat shell | boot normal, adb siap ~10 detik |
+
+`WsaClient.exe` butuh identitas paket yang hanya diberikan jalur aktivasi shell.
+Implementasinya memakai `rundll32 url.dll,FileProtocolHandler wsa://systemsettings`,
+karena argumen kosong yang dibutuhkan `cmd /c start` ditolak `std::process::Command`.
+
+`reboot -p` dipakai sebagai langkah pertama Stop karena `/shutdown` milik WsaClient
+hanya bereaksi kalau jendela UI-nya aktif. Perlu diingat: `reboot -p` menghentikan
+Android tetapi kadang meninggalkan `vmmemWSA` dan proses `WsaClient` menggantung;
+Start berikutnya tetap berhasil karena jalur aktivasi dipakai ulang.
+
+Probe port berjalan di worker thread dengan batas 40 ms dan hasilnya di-cache. Jangan
+pindahkan ke jalur render: TCP connect ke port tertutup membakar seluruh waktu retry
+Windows (terukur ~2 detik per percobaan), dan UI akan tersendat tiap frame.
 
 ## Konfigurasi
 
@@ -51,6 +123,8 @@ sendiri (Settings → Live interval).
 sdk_override=            # kosong = auto-deteksi ANDROID_SDK_ROOT / ANDROID_HOME / %LOCALAPPDATA%\Android\Sdk
 extra_args=-gpu host     # argumen tambahan untuk emulator
 live_ms=900              # interval live screenshot/logcat
+wsa_root=                # kosong = auto-deteksi folder install WSA
+wsa_autostart=1          # 1 = adb connect saat panel dibuka
 ```
 
 Deteksi SDK memakai urutan: `ANDROID_SDK_ROOT`, `ANDROID_HOME`, `%LOCALAPPDATA%\Android\Sdk`,
@@ -82,6 +156,9 @@ flowchart TD
 - `tasks.rs` — channel `Msg`; setiap pekerjaan berat jalan di thread sendiri, UI tidak
   pernah memblokir.
 - `settings.rs` — baca/tulis `settings.ini`.
+- `wsa.rs` — deteksi + pemasangan WSA (`Get-AppxPackage` / `Add-AppxPackage`),
+  start/stop lewat `WsaClient.exe`, probe port ADB, daftar aplikasi, dan browser file
+  guest (`ls`, `pull`).
 
 ## Catatan performa
 

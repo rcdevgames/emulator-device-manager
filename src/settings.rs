@@ -6,6 +6,10 @@ pub struct Settings {
     pub sdk_override: String,
     pub extra_args: String,
     pub live_ms: u64,
+    /// WSA install directory; empty means auto-detect.
+    pub wsa_root: String,
+    /// Kicked off on launch so the WSA agent is usable without opening any app.
+    pub wsa_autostart: bool,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -20,6 +24,7 @@ impl Settings {
     pub fn load() -> Settings {
         let mut s = Settings {
             live_ms: 900,
+            wsa_autostart: true,
             ..Default::default()
         };
         let Some(path) = config_path() else { return s };
@@ -31,6 +36,8 @@ impl Settings {
                 "sdk_override" => s.sdk_override = v,
                 "extra_args" => s.extra_args = v,
                 "live_ms" => s.live_ms = v.parse().unwrap_or(900).clamp(250, 5000),
+                "wsa_root" => s.wsa_root = v,
+                "wsa_autostart" => s.wsa_autostart = v != "0",
                 _ => {}
             }
         }
@@ -43,8 +50,12 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let body = format!(
-            "sdk_override={}\nextra_args={}\nlive_ms={}\n",
-            self.sdk_override, self.extra_args, self.live_ms
+            "sdk_override={}\nextra_args={}\nlive_ms={}\nwsa_root={}\nwsa_autostart={}\n",
+            self.sdk_override,
+            self.extra_args,
+            self.live_ms,
+            self.wsa_root,
+            if self.wsa_autostart { 1 } else { 0 }
         );
         let _ = std::fs::write(path, body);
     }

@@ -36,6 +36,24 @@ pub enum Msg {
     Logcat(String),
     Forwards(String),
     Snapshots(String),
+    /// Android build info and user-installed packages from the WSA VM.
+    WsaInfo(Option<crate::wsa::Info>),
+    WsaPackages(Vec<String>),
+    /// Result of the off-thread ADB port probe.
+    WsaPort(bool),
+    /// Is the WSA package registered with Windows? `None` = PowerShell unsure.
+    WsaRegistered(Option<bool>),
+    /// One directory listing for the WSA file browser.
+    WsaFiles {
+        path: String,
+        entries: Vec<crate::wsa::Entry>,
+        error: String,
+    },
+    /// Outcome of `adb pull` from the WSA file browser.
+    WsaPulled {
+        local: PathBuf,
+        error: String,
+    },
     /// Completion signals for the self-scheduling workers in `app.rs`.
     Refreshed,
     Polled,
